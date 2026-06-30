@@ -61,6 +61,8 @@ typedef struct {
   ID3D12DXVKInteropDevice *d3d12_device;
   ID3D12DXVKInteropDevice2 *d3d12_device2;
   ID3D12CommandQueue *d3d12_queue;
+  ID3D12CommandQueue *d3d12_app_queue;
+  ID3D12CommandQueue *d3d12_transition_queue;
 
   VkDevice vk_device;
   VkQueue vk_queue;

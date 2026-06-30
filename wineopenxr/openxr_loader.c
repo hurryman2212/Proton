@@ -498,10 +498,18 @@ XrResult WINAPI xrDestroyInstance(XrInstance instance) {
   }
 
   if (wine_instance->d3d12_device) {
-    vkDestroyCommandPool(wine_instance->vk_device, wine_instance->vk_command_pool, NULL);
+    if (wine_instance->vk_device && wine_instance->vk_command_pool) {
+      vkDestroyCommandPool(wine_instance->vk_device, wine_instance->vk_command_pool, NULL);
+    }
     assert(!wine_instance->d3d12_device2 || (void *)wine_instance->d3d12_device2 == (void *)wine_instance->d3d12_device);
     wine_instance->d3d12_device->lpVtbl->Release(wine_instance->d3d12_device);
-    wine_instance->d3d12_queue->lpVtbl->Release(wine_instance->d3d12_queue);
+    if (wine_instance->d3d12_queue) {
+      wine_instance->d3d12_queue->lpVtbl->Release(wine_instance->d3d12_queue);
+    }
+    if (wine_instance->d3d12_app_queue &&
+        wine_instance->d3d12_app_queue != wine_instance->d3d12_queue) {
+      wine_instance->d3d12_app_queue->lpVtbl->Release(wine_instance->d3d12_app_queue);
+    }
   }
 
   free(wine_instance);
@@ -622,9 +630,12 @@ XrResult WINAPI xrCreateSession(XrInstance instance, const XrSessionCreateInfo *
             .pNext = NULL,
         };
         HRESULT hr;
-        UINT32 queue_index;
-        VkQueueFlags queue_flags;
+        UINT32 app_queue_family_index, app_queue_index, xr_queue_family_index,
+            xr_queue_index;
+        VkQueue app_vk_queue, xr_vk_queue;
+        VkQueueFlags app_queue_flags, xr_queue_flags;
         ID3D12DeviceExt1 *device_ext;
+        ID3D12CommandQueue *interop_queue = NULL;
         hr = ID3D12Device_QueryInterface(their_d3d12_binding->device, &IID_ID3D12DXVKInteropDevice2,
                                          (void **)&wine_instance->d3d12_device2);
         if (SUCCEEDED(hr))
@@ -645,17 +656,77 @@ XrResult WINAPI xrCreateSession(XrInstance instance, const XrSessionCreateInfo *
         our_vk_binding.type = XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR;
         our_vk_binding.next = NULL;
 
-        wine_instance->d3d12_queue = their_d3d12_binding->queue;
-        their_d3d12_binding->queue->lpVtbl->AddRef(their_d3d12_binding->queue);
+        wine_instance->d3d12_app_queue = their_d3d12_binding->queue;
+        wine_instance->d3d12_app_queue->lpVtbl->AddRef(wine_instance->d3d12_app_queue);
+
+        hr = device_ext->lpVtbl->GetVulkanQueueInfoEx(
+            device_ext, wine_instance->d3d12_app_queue, &app_vk_queue,
+            &app_queue_index, &app_queue_flags, &app_queue_family_index);
+        if (FAILED(hr)) {
+          WARN("GetVulkanQueueInfoEx failed for app queue %p: %08x\n",
+               wine_instance->d3d12_app_queue, hr);
+          device_ext->lpVtbl->Release(device_ext);
+          return XR_ERROR_RUNTIME_FAILURE;
+        }
+        TRACE("App D3D12 queue %p maps to Vulkan queue %p family %u index %u "
+              "flags %#x.\n",
+              wine_instance->d3d12_app_queue, (void *)app_vk_queue,
+              app_queue_family_index, app_queue_index, app_queue_flags);
+
+        if (wine_instance->d3d12_device2) {
+          D3D12_COMMAND_QUEUE_DESC queue_desc;
+
+          their_d3d12_binding->queue->lpVtbl->GetDesc(their_d3d12_binding->queue, &queue_desc);
+          hr = wine_instance->d3d12_device2->lpVtbl->CreateInteropCommandQueue(
+              wine_instance->d3d12_device2, &queue_desc, app_queue_family_index,
+              &interop_queue);
+          if (SUCCEEDED(hr)) {
+            TRACE("Using dedicated D3D12 interop queue %p instead of app queue %p.\n", interop_queue,
+                  their_d3d12_binding->queue);
+            wine_instance->d3d12_queue = interop_queue;
+          } else {
+            WARN("CreateInteropCommandQueue failed: %08x, using app queue %p.\n", hr, their_d3d12_binding->queue);
+          }
+        }
+
+        if (!wine_instance->d3d12_queue) {
+          wine_instance->d3d12_queue = wine_instance->d3d12_app_queue;
+        }
 
         wine_instance->d3d12_device->lpVtbl->GetVulkanHandles(wine_instance->d3d12_device, &our_vk_binding.instance,
                                                               &our_vk_binding.physicalDevice, &our_vk_binding.device);
-        device_ext->lpVtbl->GetVulkanQueueInfoEx(device_ext, their_d3d12_binding->queue, &wine_instance->vk_queue,
-                                                 &queue_index, &queue_flags, &our_vk_binding.queueFamilyIndex);
+        hr = device_ext->lpVtbl->GetVulkanQueueInfoEx(
+            device_ext, wine_instance->d3d12_queue, &xr_vk_queue,
+            &xr_queue_index, &xr_queue_flags, &xr_queue_family_index);
         device_ext->lpVtbl->Release(device_ext);
+        if (FAILED(hr)) {
+          WARN("GetVulkanQueueInfoEx failed: %08x\n", hr);
+          return XR_ERROR_RUNTIME_FAILURE;
+        }
+        TRACE("OpenXR D3D12 queue %p maps to Vulkan queue %p family %u index "
+              "%u flags %#x.\n",
+              wine_instance->d3d12_queue, (void *)xr_vk_queue,
+              xr_queue_family_index, xr_queue_index, xr_queue_flags);
+
+        if (wine_instance->d3d12_queue != wine_instance->d3d12_app_queue &&
+            app_queue_family_index == xr_queue_family_index) {
+          wine_instance->d3d12_transition_queue =
+              wine_instance->d3d12_app_queue;
+          wine_instance->vk_queue = app_vk_queue;
+          command_pool_create_info.queueFamilyIndex = app_queue_family_index;
+        } else {
+          if (wine_instance->d3d12_queue != wine_instance->d3d12_app_queue) {
+            WARN("Dedicated D3D12 interop queue family differs from app queue, "
+                 "using interop queue for loader submits.\n");
+          }
+          wine_instance->d3d12_transition_queue = wine_instance->d3d12_queue;
+          wine_instance->vk_queue = xr_vk_queue;
+          command_pool_create_info.queueFamilyIndex = xr_queue_family_index;
+        }
 
         wine_instance->vk_device = our_vk_binding.device;
-        our_vk_binding.queueIndex = queue_index;
+        our_vk_binding.queueIndex = xr_queue_index;
+        our_vk_binding.queueFamilyIndex = xr_queue_family_index;
         if ((res = do_vulkan_init(wine_instance, our_vk_binding.instance)) != XR_SUCCESS) {
           return res;
         }
@@ -665,7 +736,6 @@ XrResult WINAPI xrCreateSession(XrInstance instance, const XrSessionCreateInfo *
         our_create_info = *createInfo;
         our_create_info.next = &our_vk_binding;
 
-        command_pool_create_info.queueFamilyIndex = our_vk_binding.queueFamilyIndex;
         if (vkCreateCommandPool(wine_instance->vk_device, &command_pool_create_info, NULL,
                                 &wine_instance->vk_command_pool) != VK_SUCCESS) {
           WARN("vkCreateCommandPool failed\n");
@@ -1348,6 +1418,8 @@ XrResult WINAPI xrEnumerateSwapchainImages(XrSwapchain swapchain,
 
 static void lock_d3d_queue(wine_XrInstance *instance, BOOL drain_queue)
 {
+    ID3D12CommandQueue *queue = instance->d3d12_transition_queue ? instance->d3d12_transition_queue : instance->d3d12_queue;
+
     if (instance->dxvk_device)
     {
         if (drain_queue)
@@ -1355,19 +1427,21 @@ static void lock_d3d_queue(wine_XrInstance *instance, BOOL drain_queue)
         instance->dxvk_device->lpVtbl->LockSubmissionQueue(instance->dxvk_device);
     }
     else if (!drain_queue && instance->d3d12_device2)
-        instance->d3d12_device2->lpVtbl->LockVulkanQueue(instance->d3d12_device2, instance->d3d12_queue);
+        instance->d3d12_device2->lpVtbl->LockVulkanQueue(instance->d3d12_device2, queue);
     else if (instance->d3d12_device)
-        instance->d3d12_device->lpVtbl->LockCommandQueue(instance->d3d12_device, instance->d3d12_queue);
+        instance->d3d12_device->lpVtbl->LockCommandQueue(instance->d3d12_device, queue);
 }
 
 static void unlock_d3d_queue(wine_XrInstance *instance, BOOL drain_queue)
 {
+    ID3D12CommandQueue *queue = instance->d3d12_transition_queue ? instance->d3d12_transition_queue : instance->d3d12_queue;
+
     if (instance->dxvk_device)
         instance->dxvk_device->lpVtbl->ReleaseSubmissionQueue(instance->dxvk_device);
     else if (!drain_queue && instance->d3d12_device2)
-        instance->d3d12_device2->lpVtbl->UnlockVulkanQueue(instance->d3d12_device2, instance->d3d12_queue);
+        instance->d3d12_device2->lpVtbl->UnlockVulkanQueue(instance->d3d12_device2, queue);
     else if (instance->d3d12_device)
-        instance->d3d12_device->lpVtbl->UnlockCommandQueue(instance->d3d12_device, instance->d3d12_queue);
+        instance->d3d12_device->lpVtbl->UnlockCommandQueue(instance->d3d12_device, queue);
 }
 
 XrResult WINAPI xrAcquireSwapchainImage(XrSwapchain swapchain,
